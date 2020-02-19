@@ -854,14 +854,20 @@ constexpr ALchar alExtList[] =
 
 std::atomic<ALCenum> LastNullDeviceError{ALC_NO_ERROR};
 
-/* Thread-local current context */
+/* Thread-local current context. The handling may look a little obtuse, but
+ * it's designed this way to avoid a bug with 32-bit GCC/MinGW, which causes
+ * thread-local object destructors to get a junk 'this' pointer. This method
+ * has the benefit of making LocalContext access more efficient since it's a
+ * a plain pointer, with the ThreadContext object used to check it at thread
+ * exit (and given no data fields, 'this' being junk is inconsequential since
+ * it's never accessed).
+ */
+thread_local ALCcontext *LocalContext{nullptr};
 class ThreadCtx {
-    ALCcontext *ctx{nullptr};
-
 public:
     ~ThreadCtx()
     {
-        if(ctx)
+        if(ALCcontext *ctx{LocalContext})
         {
             const bool result{ctx->releaseIfNoDelete()};
             ERR("Context %p current for thread being destroyed%s!\n",
@@ -869,10 +875,10 @@ public:
         }
     }
 
-    ALCcontext *get() const noexcept { return ctx; }
-    void set(ALCcontext *ctx_) noexcept { ctx = ctx_; }
+    void set(ALCcontext *ctx) const noexcept { LocalContext = ctx; }
 };
-thread_local ThreadCtx LocalContext;
+thread_local ThreadCtx ThreadContext;
+
 /* Process-wide current context */
 std::atomic<ALCcontext*> GlobalContext{nullptr};
 
@@ -2576,10 +2582,10 @@ void ALCcontext::init()
 
 bool ALCcontext::deinit()
 {
-    if(LocalContext.get() == this)
+    if(LocalContext == this)
     {
         WARN("%p released while current on thread\n", decltype(std::declval<void*>()){this});
-        LocalContext.set(nullptr);
+        ThreadContext.set(nullptr);
         release();
     }
 
@@ -2650,7 +2656,7 @@ static ContextRef VerifyContext(ALCcontext *context)
  */
 ContextRef GetContextRef(void)
 {
-    ALCcontext *context{LocalContext.get()};
+    ALCcontext *context{LocalContext};
     if(context)
         context->add_ref();
     else
@@ -3520,7 +3526,7 @@ END_API_FUNC
 ALC_API ALCcontext* ALC_APIENTRY alcGetCurrentContext(void)
 START_API_FUNC
 {
-    ALCcontext *Context{LocalContext.get()};
+    ALCcontext *Context{LocalContext};
     if(!Context) Context = GlobalContext.load();
     return Context;
 }
@@ -3532,7 +3538,7 @@ END_API_FUNC
  */
 ALC_API ALCcontext* ALC_APIENTRY alcGetThreadContext(void)
 START_API_FUNC
-{ return LocalContext.get(); }
+{ return LocalContext; }
 END_API_FUNC
 
 /* alcMakeContextCurrent
@@ -3564,8 +3570,8 @@ START_API_FUNC
      * thread-local context. Take ownership of the thread-local context
      * reference (if any), clearing the storage to null.
      */
-    ctx = ContextRef{LocalContext.get()};
-    if(ctx) LocalContext.set(nullptr);
+    ctx = ContextRef{LocalContext};
+    if(ctx) ThreadContext.set(nullptr);
     /* Reset (decrement) the previous thread-local reference. */
 
     return ALC_TRUE;
@@ -3591,8 +3597,8 @@ START_API_FUNC
         }
     }
     /* context's reference count is already incremented */
-    ContextRef old{LocalContext.get()};
-    LocalContext.set(ctx.release());
+    ContextRef old{LocalContext};
+    ThreadContext.set(ctx.release());
 
     return ALC_TRUE;
 }
